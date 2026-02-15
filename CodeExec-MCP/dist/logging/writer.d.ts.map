@@ -1,0 +1,1 @@
+{"version":3,"file":"writer.d.ts","sourceRoot":"","sources":["../../src/logging/writer.ts"],"names":[],"mappings":"AAAA;;;;;GAKG;AAKH,OAAO,KAAK,EAAE,iBAAiB,EAAE,eAAe,EAAE,MAAM,YAAY,CAAC;AAKrE;;GAEG;AACH,wBAAsB,YAAY,CAAC,KAAK,EAAE,iBAAiB,GAAG,OAAO,CAAC,IAAI,CAAC,CAgB1E;AAED;;GAEG;AACH,wBAAsB,eAAe,CAAC,KAAK,EAAE,eAAe,GAAG,OAAO,CAAC,IAAI,CAAC,CAgB3E"}

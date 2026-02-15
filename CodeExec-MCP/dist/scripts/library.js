@@ -1,0 +1,263 @@
+/**
+ * Script Library — filesystem-based storage for reusable code scripts.
+ *
+ * Each script is a directory containing a code file + metadata.json.
+ * A consolidated index.json enables fast listing/searching.
+ */
+import { readFile, writeFile, mkdir, rm, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { getConfig, isForbiddenPath, expandHome } from '../config.js';
+import { executeInSubprocess } from '../executor/subprocess.js';
+const EXTENSIONS = {
+    python: 'script.py',
+    node: 'script.mjs',
+    bash: 'script.sh',
+};
+export class ScriptLibrary {
+    baseDir;
+    constructor(baseDir) {
+        this.baseDir = baseDir ?? getConfig().scriptsDir;
+    }
+    // ── Save ─────────────────────────────────────────────────────────────────
+    async save(opts) {
+        const slug = this.slugify(opts.name);
+        if (!slug) {
+            throw new Error('Script name must contain at least one alphanumeric character');
+        }
+        const scriptDir = this.getScriptDir(slug);
+        const isNew = !existsSync(scriptDir);
+        await mkdir(scriptDir, { recursive: true });
+        const now = new Date().toISOString();
+        const existing = isNew ? null : await this.readMetadata(slug).catch(() => null);
+        const metadata = {
+            name: slug,
+            description: opts.description,
+            language: opts.language,
+            tags: opts.tags ?? [],
+            packages: opts.packages ?? [],
+            created_at: existing?.created_at ?? now,
+            updated_at: now,
+            last_run_at: existing?.last_run_at ?? null,
+            run_count: existing?.run_count ?? 0,
+            last_run_success: existing?.last_run_success ?? null,
+        };
+        // Write code file and metadata
+        const codeFile = join(scriptDir, EXTENSIONS[opts.language]);
+        await writeFile(codeFile, opts.code, 'utf-8');
+        await writeFile(join(scriptDir, 'metadata.json'), JSON.stringify(metadata, null, 2), 'utf-8');
+        // If language changed, remove old code file
+        if (existing && existing.language !== opts.language) {
+            const oldFile = join(scriptDir, EXTENSIONS[existing.language]);
+            await rm(oldFile, { force: true });
+        }
+        // Update index
+        await this.updateIndex(slug, metadata);
+        return { name: slug, language: opts.language, created: isNew };
+    }
+    // ── Get ──────────────────────────────────────────────────────────────────
+    async get(name) {
+        const slug = this.slugify(name);
+        const metadata = await this.readMetadata(slug);
+        const codeFile = join(this.getScriptDir(slug), EXTENSIONS[metadata.language]);
+        let code;
+        try {
+            code = await readFile(codeFile, 'utf-8');
+        }
+        catch {
+            throw new Error(`Script code file not found for "${slug}"`);
+        }
+        return { code, metadata };
+    }
+    // ── List ─────────────────────────────────────────────────────────────────
+    async list(filters) {
+        const index = await this.readIndex();
+        let results = index;
+        if (filters?.language) {
+            results = results.filter((s) => s.language === filters.language);
+        }
+        if (filters?.tag) {
+            const tagLower = filters.tag.toLowerCase();
+            results = results.filter((s) => s.tags.some((t) => t.toLowerCase() === tagLower));
+        }
+        return results;
+    }
+    // ── Search ───────────────────────────────────────────────────────────────
+    async search(query) {
+        const index = await this.readIndex();
+        const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+        if (terms.length === 0)
+            return index;
+        return index.filter((script) => {
+            const searchable = [
+                script.name,
+                script.description,
+                ...script.tags,
+            ]
+                .join(' ')
+                .toLowerCase();
+            return terms.every((term) => searchable.includes(term));
+        });
+    }
+    // ── Delete ───────────────────────────────────────────────────────────────
+    async delete(name) {
+        const slug = this.slugify(name);
+        const scriptDir = this.getScriptDir(slug);
+        if (!existsSync(scriptDir)) {
+            throw new Error(`Script "${slug}" not found`);
+        }
+        await rm(scriptDir, { recursive: true, force: true });
+        await this.removeFromIndex(slug);
+        return { name: slug, deleted: true };
+    }
+    // ── Run ──────────────────────────────────────────────────────────────────
+    async run(opts) {
+        const { code, metadata } = await this.get(opts.name);
+        const config = getConfig();
+        // Validate working_dir if provided
+        let workingDir = '';
+        if (opts.working_dir) {
+            workingDir = expandHome(opts.working_dir);
+            if (isForbiddenPath(workingDir)) {
+                throw new Error(`forbidden path: ${opts.working_dir}`);
+            }
+        }
+        // Build code with args injection
+        const args = opts.args ?? [];
+        const wrappedCode = this.injectArgs(metadata.language, code, args);
+        const timeout = Math.min(opts.timeout_ms ?? config.defaultTimeoutMs, config.maxTimeoutMs);
+        const result = await executeInSubprocess({
+            language: metadata.language,
+            code: wrappedCode,
+            timeout_ms: timeout,
+            working_dir: workingDir,
+        });
+        // Update run stats
+        const success = result.exit_code === 0;
+        await this.updateRunStats(metadata.name, success);
+        return {
+            name: metadata.name,
+            execution_id: result.execution_id,
+            language: metadata.language,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exit_code,
+            duration_ms: result.duration_ms,
+            timed_out: result.timed_out,
+            truncated: result.truncated,
+        };
+    }
+    // ── Private: Args Injection ──────────────────────────────────────────────
+    injectArgs(language, code, args) {
+        if (args.length === 0)
+            return code;
+        const argsJson = JSON.stringify(args);
+        switch (language) {
+            case 'python':
+                return `import sys\nsys.argv = ['script.py'] + ${argsJson}\n${code}`;
+            case 'node':
+                return `process.argv = ['node', 'script.mjs', ...${argsJson}];\n${code}`;
+            case 'bash':
+                // For bash, args are passed via the subprocess command line
+                // We use `set --` to inject positional parameters
+                const escaped = args.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+                return `set -- ${escaped}\n${code}`;
+        }
+    }
+    // ── Private: Index Management ────────────────────────────────────────────
+    get indexPath() {
+        return join(this.baseDir, 'index.json');
+    }
+    async readIndex() {
+        try {
+            const raw = await readFile(this.indexPath, 'utf-8');
+            return JSON.parse(raw);
+        }
+        catch {
+            // Index missing or corrupt — rebuild from disk
+            return this.rebuildIndex();
+        }
+    }
+    async writeIndex(index) {
+        await mkdir(this.baseDir, { recursive: true });
+        await writeFile(this.indexPath, JSON.stringify(index, null, 2), 'utf-8');
+    }
+    async updateIndex(slug, metadata) {
+        const index = await this.readIndex();
+        const existing = index.findIndex((s) => s.name === slug);
+        if (existing >= 0) {
+            index[existing] = metadata;
+        }
+        else {
+            index.push(metadata);
+        }
+        await this.writeIndex(index);
+    }
+    async removeFromIndex(slug) {
+        const index = await this.readIndex();
+        const filtered = index.filter((s) => s.name !== slug);
+        await this.writeIndex(filtered);
+    }
+    async updateRunStats(slug, success) {
+        const now = new Date().toISOString();
+        // Update metadata.json
+        try {
+            const metadata = await this.readMetadata(slug);
+            metadata.run_count++;
+            metadata.last_run_at = now;
+            metadata.last_run_success = success;
+            await writeFile(join(this.getScriptDir(slug), 'metadata.json'), JSON.stringify(metadata, null, 2), 'utf-8');
+            // Update index
+            await this.updateIndex(slug, metadata);
+        }
+        catch {
+            // Non-critical — don't fail the run if stats update fails
+        }
+    }
+    async rebuildIndex() {
+        const index = [];
+        try {
+            const entries = await readdir(this.baseDir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (!entry.isDirectory())
+                    continue;
+                try {
+                    const metadataPath = join(this.baseDir, entry.name, 'metadata.json');
+                    const raw = await readFile(metadataPath, 'utf-8');
+                    index.push(JSON.parse(raw));
+                }
+                catch {
+                    // Skip directories without valid metadata
+                }
+            }
+        }
+        catch {
+            // Base directory doesn't exist yet — empty index
+        }
+        // Persist the rebuilt index
+        await this.writeIndex(index).catch(() => { });
+        return index;
+    }
+    // ── Private: Helpers ─────────────────────────────────────────────────────
+    async readMetadata(slug) {
+        const metaPath = join(this.getScriptDir(slug), 'metadata.json');
+        try {
+            const raw = await readFile(metaPath, 'utf-8');
+            return JSON.parse(raw);
+        }
+        catch {
+            throw new Error(`Script "${slug}" not found`);
+        }
+    }
+    getScriptDir(slug) {
+        return join(this.baseDir, slug);
+    }
+    slugify(name) {
+        return name
+            .toLowerCase()
+            .trim()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '');
+    }
+}
+//# sourceMappingURL=library.js.map

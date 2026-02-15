@@ -1,0 +1,1 @@
+{"version":3,"file":"provider.js","sourceRoot":"","sources":["../../Embeddings/provider.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,MAAM,EAAe,MAAM,oBAAoB,CAAC;AAgBzD,MAAM,OAAgB,qBAAqB;IAC/B,MAAM,CAAS;IAEzB,YAAY,IAAY;QACtB,IAAI,CAAC,MAAM,GAAG,MAAM,CAAC,KAAK,CAAC,IAAI,CAAC,CAAC;IACnC,CAAC;CAIF"}

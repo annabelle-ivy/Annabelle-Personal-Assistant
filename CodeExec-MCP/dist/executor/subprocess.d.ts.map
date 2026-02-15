@@ -1,0 +1,1 @@
+{"version":3,"file":"subprocess.d.ts","sourceRoot":"","sources":["../../src/executor/subprocess.ts"],"names":[],"mappings":"AAAA;;;;;;;;GAQG;AASH,OAAO,KAAK,EAAE,gBAAgB,EAAE,eAAe,EAAE,MAAM,YAAY,CAAC;AA4BpE,wBAAsB,mBAAmB,CACvC,OAAO,EAAE,gBAAgB,GACxB,OAAO,CAAC,eAAe,CAAC,CAoI1B"}
